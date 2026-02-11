@@ -6,7 +6,7 @@
 #   pip install -r requirements.txt
 #   python app.py
 #
-# Deploy (Render/Railway):
+# Deploy (Render):
 #   Start command: gunicorn app:app
 #   Configure DATABASE_URL (Postgres) + APP_SECRET_KEY
 
@@ -50,10 +50,11 @@ app.secret_key = os.environ.get("APP_SECRET_KEY", "dev-secret-key-change-me")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
+# Render/Heroku às vezes usam postgres:// (SQLAlchemy moderno espera postgresql://)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 if DATABASE_URL:
-    # Render às vezes usa postgres://
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
     ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True)
     USING_POSTGRES = True
 else:
@@ -70,16 +71,13 @@ class Categoria(Base):
 
     produtos = relationship("Produto", back_populates="categoria")
 
-    def __repr__(self) -> str:
-        return f"Categoria(id={self.id}, nome={self.nome!r})"
-
 
 class Produto(Base):
     __tablename__ = "produtos"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     nome = Column(String(255), nullable=False)
-    sku = Column(String(80), nullable=True, unique=True)  # código de barras / SKU (opcional)
+    sku = Column(String(80), nullable=True, unique=True)  # opcional, mas único se preenchido
     preco = Column(Numeric(12, 2), nullable=False)
     quantidade = Column(Integer, nullable=False)
     estoque_minimo = Column(Integer, nullable=False, default=0)
@@ -87,24 +85,18 @@ class Produto(Base):
     categoria_id = Column(Integer, ForeignKey("categorias.id", ondelete="SET NULL"), nullable=True)
     categoria = relationship("Categoria", back_populates="produtos")
 
-    def __repr__(self) -> str:
-        return f"Produto(id={self.id}, nome={self.nome!r})"
-
 
 def init_db() -> None:
     Base.metadata.create_all(ENGINE)
+
+    # Índices úteis (não obrigatórios)
     with ENGINE.begin() as conn:
-        # índices úteis (se suportado)
         try:
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_produtos_nome ON produtos (nome)"))
         except Exception:
             pass
-        try:
-            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_produtos_qtd ON produtos (quantidade)"))
-        except Exception:
-            pass
 
-    # Categoria padrão (para ajudar no primeiro uso)
+    # Categoria padrão
     with Session(ENGINE) as s:
         any_cat = s.execute(select(Categoria).limit(1)).scalar_one_or_none()
         if not any_cat:
@@ -124,6 +116,7 @@ def parse_float(s: str) -> Optional[float]:
     except Exception:
         return None
 
+
 def parse_int(s: str) -> Optional[int]:
     try:
         v = int(s)
@@ -131,17 +124,20 @@ def parse_int(s: str) -> Optional[int]:
     except Exception:
         return None
 
+
 def clean_name(s: str) -> str:
     return " ".join((s or "").strip().split())
 
+
 def clean_sku(s: str) -> str:
     return (s or "").strip()
+
 
 def get_categories(session: Session) -> List[Categoria]:
     return session.execute(select(Categoria).order_by(func.lower(Categoria.nome))).scalars().all()
 
 
-# ---------------- UI (templates embutidos) ----------------
+# ---------------- Templates ----------------
 
 BASE_HTML = """
 <!doctype html>
@@ -153,10 +149,9 @@ BASE_HTML = """
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
       body { background: radial-gradient(1200px 800px at 20% -10%, #e9f2ff 0%, transparent 55%),
-                       radial-gradient(1200px 800px at 95% 0%, #f4e9ff 0%, transparent 60%),
-                       #f7f7fb; }
+                     radial-gradient(1200px 800px at 95% 0%, #f4e9ff 0%, transparent 60%),
+                     #f7f7fb; }
       .card { border: 0; box-shadow: 0 10px 30px rgba(0,0,0,.08); border-radius: 18px; }
-      .brand { letter-spacing: .2px; }
       .table td, .table th { vertical-align: middle; }
       .pill { background: rgba(13,110,253,.12); color:#0d6efd; border-radius: 999px; padding:.3rem .6rem; font-weight: 800; }
       .pill-warn { background: rgba(255,193,7,.20); color:#8a6d00; }
@@ -172,7 +167,68 @@ BASE_HTML = """
   <body>
     <nav class="navbar navbar-expand-lg bg-white border-bottom sticky-top">
       <div class="container py-2">
-        <a class="navbar-brand fw-semibold brand" href="{{ url_for('home') }}">📦 Controle de Produtos</a>
+        <a class="navbar-brand fw-semibold" href="{{ url_for('home') }}">📦 Controle de Produtos</a>
+        <div class="d-flex gap-2 align-items-center flex-wrap justify-content-end">
+          <span class="badge-soft small">{{ 'Postgres' if using_postgres else 'SQLite (local)' }}</span>
+          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('export_excel') }}">Exportar Excel</a>
+          <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#catsModal">Categorias</button>
+          <a class="btn btn-sm btn-primary" href="{{ url_for('home') }}#novo">+ Novo</a>
+        </div>
+      </div>
+    </nav>
+
+    <main class="container py-4">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for category, messages in messages %}
+            <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+              {{ S }}
+              <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+
+      {{ body|safe }}
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  </body>
+</html>
+"""
+
+# Pequena correção: o loop acima com "S" fica estranho em alguns editores;
+# Vamos renderizar os flashes de forma simples no render_page()
+
+BASE_HTML = """
+<!doctype html>
+<html lang="pt-br">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title or "Controle de Produtos" }}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+      body { background: radial-gradient(1200px 800px at 20% -10%, #e9f2ff 0%, transparent 55%),
+                     radial-gradient(1200px 800px at 95% 0%, #f4e9ff 0%, transparent 60%),
+                     #f7f7fb; }
+      .card { border: 0; box-shadow: 0 10px 30px rgba(0,0,0,.08); border-radius: 18px; }
+      .table td, .table th { vertical-align: middle; }
+      .pill { background: rgba(13,110,253,.12); color:#0d6efd; border-radius: 999px; padding:.3rem .6rem; font-weight: 800; }
+      .pill-warn { background: rgba(255,193,7,.20); color:#8a6d00; }
+      .btn { border-radius: 12px; }
+      .form-control, .form-select, .input-group-text { border-radius: 12px; }
+      .muted { color: rgba(0,0,0,.55); }
+      .hint { background: rgba(25,135,84,.10); color:#198754; border-radius: 12px; padding:.35rem .6rem; font-weight: 600; }
+      .badge-soft { background: rgba(13,110,253,.10); color:#0d6efd; border-radius:999px; padding:.25rem .55rem; }
+      .mono { font-variant-numeric: tabular-nums; }
+      .small2 { font-size: .92rem; }
+    </style>
+  </head>
+  <body>
+    <nav class="navbar navbar-expand-lg bg-white border-bottom sticky-top">
+      <div class="container py-2">
+        <a class="navbar-brand fw-semibold" href="{{ url_for('home') }}">📦 Controle de Produtos</a>
         <div class="d-flex gap-2 align-items-center flex-wrap justify-content-end">
           <span class="badge-soft small">{{ 'Postgres' if using_postgres else 'SQLite (local)' }}</span>
           <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('export_excel') }}">Exportar Excel</a>
@@ -268,7 +324,7 @@ HOME_BODY = """
                 {% endfor %}
               </select>
             </div>
-            <div class="col-12 col-lg-12 d-grid mt-1">
+            <div class="col-12 d-grid mt-1">
               <button class="btn btn-success" type="submit">Salvar</button>
             </div>
           </form>
@@ -314,8 +370,7 @@ HOME_BODY = """
                 <td class="mono">R$ {{ '%.2f'|format(p.preco) }}</td>
                 <td>
                   <span class="pill mono {% if low %}pill-warn{% endif %}">
-                    {{ p.quantidade }}
-                    {% if low %} • baixo{% endif %}
+                    {{ p.quantidade }}{% if low %} • baixo{% endif %}
                   </span>
                 </td>
                 <td class="text-end">
@@ -474,11 +529,15 @@ HOME_BODY = """
 """
 
 def render_page(body: str, **ctx):
-    return render_template_string(BASE_HTML, body=render_template_string(body, **ctx), **ctx)
+    return render_template_string(
+        BASE_HTML,
+        body=render_template_string(body, **ctx),
+        **ctx,
+    )
 
 
 # ---------------- Rotas ----------------
-
+# ✅ ROTA PRINCIPAL (isso evita "Not Found" no Render)
 @app.get("/")
 def home():
     q = (request.args.get("q") or "").strip()
@@ -512,8 +571,6 @@ def home():
             stmt = stmt.where(Produto.quantidade <= Produto.estoque_minimo)
 
         produtos = session.execute(stmt).scalars().all()
-
-        # eager load categoria (acesso simples no template)
         for p in produtos:
             _ = p.categoria
 
@@ -560,20 +617,31 @@ def add():
         return redirect(url_for("home") + "#novo")
 
     with Session(ENGINE) as session:
-        # Se SKU existir, impede duplicidade por SKU
         if sku:
-            dup_sku = session.execute(select(Produto).where(func.lower(Produto.sku) == sku.lower()).limit(1)).scalar_one_or_none()
+            dup_sku = session.execute(
+                select(Produto).where(func.lower(Produto.sku) == sku.lower()).limit(1)
+            ).scalar_one_or_none()
             if dup_sku:
                 flash(f"Já existe um produto com esse SKU (ID #{dup_sku.id}).", "warning")
-                return redirect(url_for("home") + f"?q={sku}")
+                return redirect(url_for("home", q=sku))
 
-        # Também alerta por nome (case-insensitive)
-        dup_nome = session.execute(select(Produto).where(func.lower(Produto.nome) == nome.lower()).limit(1)).scalar_one_or_none()
+        dup_nome = session.execute(
+            select(Produto).where(func.lower(Produto.nome) == nome.lower()).limit(1)
+        ).scalar_one_or_none()
         if dup_nome:
-            flash(f"Já existe um produto com esse nome (ID #{dup_nome.id}). Use a pesquisa para encontrá-lo.", "warning")
-            return redirect(url_for("home") + f"?q={nome}")
+            flash(f"Já existe um produto com esse nome (ID #{dup_nome.id}). Use a pesquisa.", "warning")
+            return redirect(url_for("home", q=nome))
 
-        session.add(Produto(nome=nome, sku=sku or None, preco=preco, quantidade=qtd, estoque_minimo=minimo, categoria_id=cat_id))
+        session.add(
+            Produto(
+                nome=nome,
+                sku=sku or None,
+                preco=preco,
+                quantidade=qtd,
+                estoque_minimo=minimo,
+                categoria_id=cat_id,
+            )
+        )
         session.commit()
 
     flash("Produto cadastrado com sucesso!", "success")
@@ -622,22 +690,20 @@ def edit():
             flash("Produto não encontrado.", "warning")
             return redirect(url_for("home"))
 
-        # SKU único
         if sku:
             dup_sku = session.execute(
                 select(Produto).where(func.lower(Produto.sku) == sku.lower(), Produto.id != pid_int).limit(1)
             ).scalar_one_or_none()
             if dup_sku:
                 flash(f"Já existe outro produto com esse SKU (ID #{dup_sku.id}).", "warning")
-                return redirect(url_for("home") + f"?q={sku}")
+                return redirect(url_for("home", q=sku))
 
-        # Nome duplicado (alerta)
         dup_nome = session.execute(
             select(Produto).where(func.lower(Produto.nome) == nome.lower(), Produto.id != pid_int).limit(1)
         ).scalar_one_or_none()
         if dup_nome:
             flash(f"Já existe outro produto com esse nome (ID #{dup_nome.id}).", "warning")
-            return redirect(url_for("home") + f"?q={nome}")
+            return redirect(url_for("home", q=nome))
 
         p.nome = nome
         p.sku = sku or None
@@ -691,8 +757,6 @@ def stock(pid: int):
     return redirect(url_for("home"))
 
 
-# -------- Categorias --------
-
 @app.post("/categorias/add")
 def add_category():
     nome = clean_name(request.form.get("nome", ""))
@@ -701,7 +765,9 @@ def add_category():
         return redirect(url_for("home"))
 
     with Session(ENGINE) as session:
-        dup = session.execute(select(Categoria).where(func.lower(Categoria.nome) == nome.lower()).limit(1)).scalar_one_or_none()
+        dup = session.execute(
+            select(Categoria).where(func.lower(Categoria.nome) == nome.lower()).limit(1)
+        ).scalar_one_or_none()
         if dup:
             flash("Essa categoria já existe.", "warning")
             return redirect(url_for("home"))
@@ -719,9 +785,10 @@ def delete_category(cid: int):
         if not c:
             flash("Categoria não encontrada.", "warning")
             return redirect(url_for("home"))
-        # Desvincula produtos
+
         for p in session.execute(select(Produto).where(Produto.categoria_id == cid)).scalars().all():
             p.categoria_id = None
+
         session.delete(c)
         session.commit()
 
@@ -729,15 +796,10 @@ def delete_category(cid: int):
     return redirect(url_for("home"))
 
 
-# -------- Export Excel --------
-
 @app.get("/export.xlsx")
 def export_excel():
     with Session(ENGINE) as session:
-        produtos = session.execute(
-            select(Produto).order_by(Produto.id.asc())
-        ).scalars().all()
-        # carrega categorias
+        produtos = session.execute(select(Produto).order_by(Produto.id.asc())).scalars().all()
         for p in produtos:
             _ = p.categoria
 
@@ -761,7 +823,6 @@ def export_excel():
             "SIM" if low else "NÃO",
         ])
 
-    # Ajuste simples de largura
     for col in range(1, len(headers) + 1):
         ws.column_dimensions[get_column_letter(col)].width = 18
 
